@@ -4,8 +4,6 @@
 
 Say you have something in [Caddy](https://caddyserver.com/) that you only want specific IPs to access, but those IPs can change from time to time. It would be tedious to manage the list of trusted IPs yourself, so this script lets your users self-service that management. If a user changes their location and gets a new IP, then they can hit an endpoint to become trusted again and no longer trust the old location.
 
-Don't use this to manage a list of _static_ IPs or subnets. Do that in Caddy normally to avoid unnecessary load. Only use this for IPs that are likely to change every now and then. For example, don't do this to trust your entire LAN.
-
 ## What does it do?
 
 When Caddy receives a request, it uses [`forward_auth`](https://caddyserver.com/docs/caddyfile/directives/forward_auth) to forward the request onto a Python microservice first. If the microservice says it's trusted, then the request continues normally. If not, the request gets blocked by Caddy. All this is transparent to whatever you're actually hosting on Caddy.
@@ -45,12 +43,14 @@ Then you need to protect the endpoints. There are many ways of doing this, so it
 * `/trust_me` must be protected by Authentik or another reverse proxy capable authorization solution. Such a solution must be able, on an authenticated request, send an HTTP header along with the username/email/etc. of the currently logged in user. In Authentik, you would do this with a reverse proxy provider pointing to the microservice and use the `X-authentik-username` header. **This is the only endpoint that should be internet-accessible.** Be sure this endpoint itself doesn't get dependent on itself (i.e., don't use it where hitting `/trust_me` could actually hit the endpoint recursively).
 * `/health` should only be accessible to a health checker like [Uptime Kuma](https://uptime.kuma.pet/) if you want to monitor it.
 
-And then the important part: integrate it into Caddy. A basic configuration would look like:
+And then the important part: integrate it into Caddy. A basic configuration would look like this.
 
 ```
 forward_auth {
-    uri http://localhost:5554/check # change if running on a separate host than Caddy
-    copy_headers X-Forwarded-For X-authentik-username # update as needed based on your setup
+    uri localhost:5554/check # change if running on a separate host than Caddy
+    # If the header containing the actual IP isn't X-Forwarded-For or another header that
+    # Caddy automatically sends to the forward_auth endpoint, you'll need to add it, like:
+    #copy_headers X-Foo
 }
 
 # stuff here only gets invoked if the forward_auth passes
@@ -58,6 +58,8 @@ forward_auth {
 # file_server ...
 # etc.
 ```
+
+If you have a static IP or subnet you always want to allow, add them as subnets to `TRUSTED_SUBNETS` in `.env` and restart the service. For example, you might always want to implicitly trust LAN traffic, but require explicit trust of internet traffic. You should do this for all static IPs/subnets instead of explicitly trusting them because it skips checking in Redis.
 
 ## What's left?
 
