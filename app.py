@@ -1,6 +1,8 @@
 import ipaddress
 import logging
 import os
+from ipaddress import IPv4Network, IPv6Network
+
 import redis
 import dotenv
 from flask import Flask, request, abort, make_response
@@ -41,9 +43,19 @@ def init_redis_connection() -> redis.Redis:
 
 with app.app_context():
     redis_connection = init_redis_connection()
+    trusted_subnets: list[IPv4Network | IPv6Network] = []
+    for subnet_str in [subnet_str.strip() for subnet_str in os.getenv("TRUSTED_SUBNETS").split(",")]:
+        try:
+            subnet = ipaddress.ip_network(subnet_str)
+        except ValueError as e:
+            app.logger.warning(f"Ignoring subnet {subnet_str} as implicitly trusted because it can't be parsed: {e}")
+            continue
+
+        trusted_subnets.append(subnet)
+
 
 def is_trusted(ip: str) -> bool:
-    return redis_connection.exists(ip)
+    return any(ipaddress.ip_address(ip) in subnet for subnet in trusted_subnets) or redis_connection.exists(ip)
 
 @app.route("/check", methods = ["GET"])
 def check():
@@ -67,6 +79,10 @@ def trust_me():
         username = get_client_username()
         if not username:
             raise ValueError("No username header value provided in request")
+
+        if any(ipaddress.ip_address(new_ip) in subnet for subnet in trusted_subnets):
+            app.logger.info(f"Ignoring request to trust {new_ip} for {username} because it's already in a trusted subnet")
+            return make_response("", 204)
 
         pipe = redis_connection.pipeline()
 
