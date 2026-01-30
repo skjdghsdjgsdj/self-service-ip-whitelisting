@@ -1,0 +1,28 @@
+version: '3.8'
+services:
+  app:
+    build: .
+    ports:
+      - "5554:5554"
+    env_file:
+      - .env
+    environment:
+      - APP_LOG_LEVEL=INFO  # Override: DEBUG/WARNING/ERROR
+      - REDIS_HOST=redis
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --save 60 1
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:

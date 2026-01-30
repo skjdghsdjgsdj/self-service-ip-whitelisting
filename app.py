@@ -1,90 +1,49 @@
-import datetime
 import ipaddress
+import logging
 import os
-from typing import Final
-
-CACHE_TTL_SECONDS: Final[int] = os.environ.get("CACHE_TTL_SECONDS", 300)
-
+import redis
 import dotenv
 from flask import Flask, request, abort, make_response
-from peewee import MySQLDatabase, Model, CharField, IPField, DateTimeField
+from redis.backoff import ExponentialBackoff
+from redis.retry import Retry
 
 dotenv.load_dotenv()
 
-db = MySQLDatabase(
-    database = os.environ.get("MYSQL_DATABASE"),
-    user = os.environ.get("MYSQL_USER"),
-    password = os.environ.get("MYSQL_PASSWORD"),
-    host = os.environ.get("MYSQL_HOST", "localhost"),
-    port = os.environ.get("MYSQL_PORT", 3306)
-)
-
-class BaseModel(Model):
-    class Meta:
-        database = db
-
-class TrustedIP(BaseModel):
-    username = CharField(primary_key = True)
-    ip = IPField()
-    created = DateTimeField(default = datetime.datetime.now)
-    modified = DateTimeField()
-
-    class Meta:
-        table_name = "trusted_ips"
-
 app = Flask(__name__)
+log_level_str = os.getenv('APP_LOG_LEVEL', 'INFO').upper()
+app.logger.setLevel(getattr(logging, log_level_str, logging.INFO))
 
-auth_cache: dict[str, tuple[bool, datetime.datetime]] = {} # IP to tuple of is trusted and expiry datetime
+def init_redis_connection() -> redis.Redis:
+    global redis_connection
+    connection_args = dict(
+        host = os.getenv("REDIS_HOST"),
+        port = int(os.getenv("REDIS_PORT", 6379)),
+        db = int(os.getenv("REDIS_DB", 0)),
+        decode_responses = True,
+        retry_on_timeout = True,
+        retry = Retry(ExponentialBackoff(cap = 10, base = 1), 3),
+        retry_on_error = [redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
+        health_check_interval = 30,
+        socket_timeout = 5,
+        socket_connect_timeout = 5
+    )
+    password = os.getenv("REDIS_PASSWORD")
+    if password:
+        connection_args["password"] = password
+        username = os.getenv("REDIS_USERNAME")
+        if username:
+            connection_args["username"] = username
+
+    pool = redis.BlockingConnectionPool(max_connections = int(os.getenv("REDIS_MAX_CONNECTIONS", 10)), **connection_args)
+    connection = redis.Redis(connection_pool = pool)
+
+    return connection
+
 with app.app_context():
-    for row in TrustedIP.select():
-        auth_cache[row.ip] = (True, datetime.datetime.now() + datetime.timedelta(seconds = CACHE_TTL_SECONDS))
-
-    app.logger.info(f"Populated auth cache with {len(auth_cache)} trusted IPs")
-
-@app.route("/list", methods = ["GET"])
-def list_trusted_ips():
-    json = []
-    for row in TrustedIP.select():
-        _, expires = auth_cache.get(row.ip) or (None, None)
-
-        json.append({
-            "username": row.username,
-            "ip": str(row.ip),
-            "created": row.created.isoformat(),
-            "modified": None if not row.modified else row.modified.isoformat(),
-            "cache_ttl": None if expires is None else expires.isoformat(),
-            "is_trusted": True
-        })
-
-    for ip, (is_trusted, expires) in auth_cache.items():
-        for row in json:
-            if ip == row["ip"]:
-                continue
-
-        json.append({
-            "username": None,
-            "ip": ip,
-            "created": None,
-            "modified": None,
-            "cache_ttl": expires.isoformat(),
-            "is_trusted": is_trusted
-        })
-
-    return json
+    redis_connection = init_redis_connection()
 
 def is_trusted(ip: str) -> bool:
-    is_trusted, expires = auth_cache.get(ip) or (None, None)
-    if is_trusted is None or expires <= datetime.datetime.now():
-        expires = datetime.datetime.now() + datetime.timedelta(seconds = CACHE_TTL_SECONDS)
-        is_trusted = TrustedIP.select().where(TrustedIP.ip == ip).exists()
-
-        auth_cache[ip] = (is_trusted, expires)
-
-        app.logger.info(f"Persisted to cache: IP {ip} is {'trusted' if is_trusted else 'not trusted'}, TTL {expires.isoformat()}")
-    else:
-        app.logger.debug(f"Cache hit: IP {ip} is {'trusted' if is_trusted else 'not trusted'}, TTL {expires.isoformat()}")
-
-    return is_trusted
+    return redis_connection.exists(ip)
 
 @app.route("/check", methods = ["GET"])
 def check():
@@ -93,6 +52,7 @@ def check():
         if is_trusted(client_ip):
             return make_response("", 204)
         else:
+            app.logger.info(f"Denying access to {client_ip}")
             return make_response("Access denied", 403)
     except Exception as e:
         app.logger.error(e)
@@ -101,51 +61,54 @@ def check():
 @app.route("/trust_me", methods = ["GET"])
 def trust_me():
     try:
-        ip = get_client_ip()
+        new_ip = get_client_ip()
+        if not new_ip:
+            raise ValueError("No client IP header value provided in request")
         username = get_client_username()
+        if not username:
+            raise ValueError("No username header value provided in request")
+
+        old_ips = list(redis_connection.smembers(f"user:{username}"))
+        pipe = redis_connection.pipeline()
+        if old_ips:
+            app.logger.info(f"Revoking trust for old IP(s) for {username}: {', '.join(old_ips)}")
+            pipe.delete(*old_ips)
+        pipe.delete(f"user:{username}")
+        pipe.hset(new_ip, mapping={"username": username})
+        pipe.sadd(f"user:{username}", new_ip)
+        pipe.execute()
+
+        app.logger.info(f"Trusted IP {new_ip} for {username}")
     except Exception as e:
-        app.logger.error(e)
-        abort(400)
-
-    with db.atomic() as transaction:
-        try:
-            existing_row = TrustedIP.select().where(TrustedIP.username == username).first()
-            if not existing_row:
-                app.logger.info(f"Trusting {username} at {ip} for the first time")
-                TrustedIP(
-                    username = username,
-                    ip = ip
-                ).save(force_insert = True)
-            elif existing_row.ip != ip:
-                app.logger.info(f"{username}'s IP changed from {existing_row.ip} to {ip}")
-                existing_row.ip = ip
-                existing_row.modified = datetime.datetime.now()
-                existing_row.save()
-
-                # cache bust the old IP
-                auth_cache.pop(existing_row.ip)
-            else:
-                app.logger.info(f"{username}'s trusted IP is already {existing_row.ip}; nothing to do")
-
-            auth_cache[ip] = (True, datetime.datetime.now() + datetime.timedelta(seconds = os.environ.get("CACHE_TTL_SECONDS", 300)))
-
-        except Exception as e:
-            app.logger.error(e)
-            transaction.rollback()
-            abort(500)
+        app.logger.error(f"Failed to manage trust state change: {e}")
+        return make_response("", 400)
 
     return make_response("", 204)
 
-def get_client_ip() -> str:
-    client_ip_header = os.environ.get("CLIENT_IP_HEADER", "X-Forwarded-For")
-    if client_ip_header not in request.headers:
-        raise ValueError(f"No header \"{client_ip_header}\" in request")
+@app.route("/health", methods=["GET"])
+def health():
+    try:
+        redis_connection.ping()
+        return {
+            "status": "ok"
+        }
+    except Exception as e:
+        app.logger.error(f"Redis PING failure: {e}")
+        return {
+            "status": "error"
+        }, 500
 
-    header_value = request.headers[client_ip_header]
+def get_client_ip() -> str:
+    client_ip_header = os.getenv("CLIENT_IP_HEADER", "X-Forwarded-For")
+    if client_ip_header not in request.headers:
+        raise ValueError(f"No header '{client_ip_header}' in request")
+
+    header_value = request.headers[client_ip_header].strip().split(',')[0].strip()
+
     try:
         return str(ipaddress.ip_address(header_value))
     except ValueError as e:
-        raise ValueError(f"IP \"{header_value}\" defined in header \"{client_ip_header}\" is not valid", e)
+        raise ValueError(f"IP '{header_value}' in '{client_ip_header}' invalid", e)
 
 def get_client_username() -> str:
     username_header = os.getenv("CLIENT_USERNAME_HEADER")
@@ -160,6 +123,11 @@ def get_client_username() -> str:
         raise ValueError(f"Header \"{username_header}\" is empty")
 
     return username
+
+@app.errorhandler(500)
+def handle_exception(e):
+    app.logger.exception("Unhandled exception: %s", e)
+    return "Internal Server Error", 500
 
 
 if __name__ == '__main__':
