@@ -71,8 +71,11 @@ def trust_me():
         old_ips = list(redis_connection.smembers(f"user:{username}"))
         pipe = redis_connection.pipeline()
         if old_ips:
-            app.logger.info(f"Revoking trust for old IP(s) for {username}: {', '.join(old_ips)}")
-            pipe.delete(*old_ips)
+            if len(old_ips) == 1 and old_ips[0] == new_ip:
+                app.logger.info(f"{username}'s IP didn't change ({new_ip})")
+            else:
+                app.logger.info(f"Revoking trust for old IP(s) for {username}: {', '.join(old_ips)}")
+                pipe.delete(*old_ips)
         pipe.delete(f"user:{username}")
         pipe.hset(new_ip, mapping={"username": username})
         pipe.sadd(f"user:{username}", new_ip)
