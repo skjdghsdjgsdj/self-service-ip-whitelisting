@@ -86,6 +86,9 @@ def trust_me():
             app.logger.info(f"Ignoring request to trust {new_ip} for {username} because it's already in a trusted subnet")
             return make_response("", 204)
 
+        new_ip_key = f"{REDIS_PREFIX}:{new_ip}"
+        payload = {"username": username}
+
         pipe = redis_connection.pipeline()
 
         # revoke trust for old IPs if they changed
@@ -98,6 +101,10 @@ def trust_me():
 
             old_ip = old_ip_key[len(f"{REDIS_PREFIX}:"):]
             if old_ip == new_ip:
+                if not redis_connection.exists(new_ip_key):
+                    app.logger.warning(f"Index for {username} points to IP {new_ip} but no key exists; adding one. If "
+                                       f"you dropped the key yourself, you also need to update or drop the index.")
+                    pipe.hset(new_ip_key, mapping = payload)
                 app.logger.info(f"{username} is already trusted at {new_ip}; ignoring request")
                 return make_response("", 204)
 
@@ -105,9 +112,8 @@ def trust_me():
             pipe.delete(old_ip_key)
 
         # update the index to point to the new IP
-        new_ip_key = f"{REDIS_PREFIX}:{new_ip}"
         pipe.delete(f"{REDIS_PREFIX}:user:{username}")
-        pipe.hset(new_ip_key, mapping = {"username": username})
+        pipe.hset(new_ip_key, mapping = payload)
         pipe.sadd(f"{REDIS_PREFIX}:user:{username}", new_ip_key)
         pipe.execute()
 
