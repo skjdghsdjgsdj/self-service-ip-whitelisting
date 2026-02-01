@@ -35,7 +35,7 @@ Here's how the flow works when a user wants to have their IP trusted:
 2. Cloudflare adds its `X-Forwarded-For` header pointing to the user's actual IP, then sends it onto your Caddy origin.
 3. Caddy sends the request to Authentik's proxy provider (something you need to set up yourself).
 4. Authentik sends the request to the `localhost:5554/trust_me` endpoint, and in the process, injects its `X-authentik-username` header for the currently logged in user. If the user isn't logged in, they get redirected to the login.
-5. The microservice looks up the user's old trusted IP if it exists and deletes the Redis key, then inserts a new one for the new IP in `X-Forwarded-For` and stores metadata saying "this IP is for the username defined in `X-authentik-username`.
+5. The microservice looks up the user's old trusted IP if it exists and deletes the Redis key, then inserts a new one for the new IP in `X-Forwarded-For` and stores metadata saying "this IP is for the username defined in `X-authentik-username`".
 6. The microservice responds with 2xx, and now the user can hit endpoints locked down with `forward_auth` normally.
 
 Think of this as a tool in your toolchain for authentication and authorization; it just handles the logistics of managing and checking IP addresses. Managing the trust access itself is up to you via Authenik or whatever else you're using, and in that system is where you'll manage the actual authorization of "is this user allowed to log in and are they allowed to manage their trusted IPs."
