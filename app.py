@@ -53,9 +53,11 @@ with app.app_context():
 
         trusted_subnets.append(subnet)
 
+    REDIS_PREFIX = os.getenv("REDIS_PREFIX", "ip-whitelist")
 
 def is_trusted(ip: str) -> bool:
-    return any(ipaddress.ip_address(ip) in subnet for subnet in trusted_subnets) or redis_connection.exists(ip)
+    return any(ipaddress.ip_address(ip) in subnet for subnet in trusted_subnets) or \
+        redis_connection.exists(f"{REDIS_PREFIX}:{ip}")
 
 @app.route("/check", methods = ["GET"])
 def check():
@@ -87,19 +89,26 @@ def trust_me():
         pipe = redis_connection.pipeline()
 
         # revoke trust for old IPs if they changed
-        old_ips = list(redis_connection.smembers(f"user:{username}"))
-        if old_ips:
-            if len(old_ips) == 1 and old_ips[0] == new_ip: # only one trusted IP and it's the same thing
-                app.logger.info(f"{username} only has one trusted IP and it's already {new_ip}")
+        for old_ip_key in redis_connection.smembers(f"{REDIS_PREFIX}:user:{username}"):
+            if not old_ip_key.startswith(f"{REDIS_PREFIX}:"):
+                app.logger.warning(f"{username} is assocated to key {old_ip_key} which doesn't have prefix "
+                                   f"{REDIS_PREFIX}:; it will be deleted.")
+                pipe.delete(old_ip_key)
+                continue
+
+            old_ip = old_ip_key[len(f"{REDIS_PREFIX}:"):]
+            if old_ip == new_ip:
+                app.logger.info(f"{username} is already trusted at {new_ip}; ignoring request")
                 return make_response("", 204)
 
-            app.logger.info(f"Revoking trust for old IP(s) for {username}: {', '.join(old_ips)}")
-            pipe.delete(*old_ips)
+            app.logger.info(f"Revoking trust for {username} at {old_ip}")
+            pipe.delete(old_ip_key)
 
-        pipe.delete(f"user:{username}")
-
-        pipe.hset(new_ip, mapping={"username": username})
-        pipe.sadd(f"user:{username}", new_ip)
+        # update the index to point to the new IP
+        new_ip_key = f"{REDIS_PREFIX}:{new_ip}"
+        pipe.delete(f"{REDIS_PREFIX}:user:{username}")
+        pipe.hset(new_ip_key, mapping = {"username": username})
+        pipe.sadd(f"{REDIS_PREFIX}:user:{username}", new_ip_key)
         pipe.execute()
 
         app.logger.info(f"Trusted IP {new_ip} for {username}")
