@@ -26,7 +26,15 @@ To run this, you need:
 * Caddy
 * [Authentik](https://goauthentik.io/) or something else that provides authentication and authorization, and can function as a reverse proxy once a user is authenticated
 
-If you're so inclined, you can also just run the Python app directly. It is a normal Flask microservice. You can also connect to a separately managed Redis instance, although note that the app uses keys of IP addresses and doesn't use namespacing/prefixing/etc.
+If you're so inclined, you can also just run the Python app directly. It is a normal Flask microservice.
+
+You can also connect to a separately managed Redis instance by changing `docker-compose.yml` or the values in `.env`. If you do that, the ACL for the user looks like:
+
+```
+user foo on >bar +@read +@write +@transaction +ping ~ip-whitelist:*
+```
+
+Change `foo` to the username, `bar` to the password, and if you changed `REDIS_PREFIX`, change `ip-whitelist` to that.
 
 ## How do I set it up?
 
